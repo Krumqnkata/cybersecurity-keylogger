@@ -231,9 +231,9 @@ class MainApplication:
         "5 минути": 300,
     }
     PLAYBACK_SPEEDS = {
-        "1,0 сек.": 1000,
         "0,5 сек.": 500,
         "0,2 сек.": 200,
+        "0,1 сек.": 100,
     }
 
     def __init__(self, root: tk.Tk) -> None:
@@ -563,7 +563,7 @@ class MainApplication:
             replay_controls, text="Отначало", command=self._restart_replay
         ).pack(side="left", padx=6)
         ttk.Label(replay_controls, text="Скорост:").pack(side="left", padx=(14, 4))
-        self.playback_speed_var = tk.StringVar(value="0,5 сек.")
+        self.playback_speed_var = tk.StringVar(value="0,2 сек.")
         self.playback_speed_box = ttk.Combobox(
             replay_controls,
             textvariable=self.playback_speed_var,
@@ -907,7 +907,7 @@ class MainApplication:
 
     def _schedule_playback_tick(self) -> None:
         self._cancel_after("_playback_after_id")
-        delay = self.PLAYBACK_SPEEDS.get(self.playback_speed_var.get(), 500)
+        delay = self.PLAYBACK_SPEEDS.get(self.playback_speed_var.get(), 200)
         self._playback_after_id = self.root.after(delay, self._playback_tick)
 
     def _playback_tick(self) -> None:

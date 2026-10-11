@@ -8,6 +8,94 @@ from collections.abc import Callable
 from typing import Any
 
 
+class _ForegroundLayoutTranslator:
+    """Translate a virtual key with the foreground window's Windows layout."""
+
+    _VK_SHIFT = 0x10
+    _VK_CONTROL = 0x11
+    _VK_MENU = 0x12
+    _VK_CAPITAL = 0x14
+    _VK_NUMLOCK = 0x90
+    _MAPVK_VK_TO_VSC = 0
+    _NO_STATE_CHANGE = 0x04
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        self._ctypes = ctypes
+        self._user32 = ctypes.WinDLL("user32", use_last_error=True)
+        hkl = getattr(wintypes, "HKL", wintypes.HANDLE)
+
+        self._user32.GetForegroundWindow.argtypes = ()
+        self._user32.GetForegroundWindow.restype = wintypes.HWND
+        self._user32.GetWindowThreadProcessId.argtypes = (
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        self._user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        self._user32.GetKeyboardLayout.argtypes = (wintypes.DWORD,)
+        self._user32.GetKeyboardLayout.restype = hkl
+        self._user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
+        self._user32.GetAsyncKeyState.restype = wintypes.SHORT
+        self._user32.GetKeyState.argtypes = (ctypes.c_int,)
+        self._user32.GetKeyState.restype = wintypes.SHORT
+        self._user32.MapVirtualKeyExW.argtypes = (
+            wintypes.UINT,
+            wintypes.UINT,
+            hkl,
+        )
+        self._user32.MapVirtualKeyExW.restype = wintypes.UINT
+        self._user32.ToUnicodeEx.argtypes = (
+            wintypes.UINT,
+            wintypes.UINT,
+            ctypes.POINTER(ctypes.c_ubyte),
+            wintypes.LPWSTR,
+            ctypes.c_int,
+            wintypes.UINT,
+            hkl,
+        )
+        self._user32.ToUnicodeEx.restype = ctypes.c_int
+
+    def __call__(self, virtual_key: int) -> str | None:
+        foreground = self._user32.GetForegroundWindow()
+        thread_id = (
+            self._user32.GetWindowThreadProcessId(foreground, None)
+            if foreground
+            else 0
+        )
+        layout = self._user32.GetKeyboardLayout(thread_id)
+        if not layout:
+            return None
+
+        state = (self._ctypes.c_ubyte * 256)()
+        state[virtual_key] = 0x80
+        for modifier in (self._VK_SHIFT, self._VK_CONTROL, self._VK_MENU):
+            if self._user32.GetAsyncKeyState(modifier) & 0x8000:
+                state[modifier] = 0x80
+        for toggle in (self._VK_CAPITAL, self._VK_NUMLOCK):
+            if self._user32.GetKeyState(toggle) & 0x0001:
+                state[toggle] = 0x01
+
+        scan_code = self._user32.MapVirtualKeyExW(
+            virtual_key, self._MAPVK_VK_TO_VSC, layout
+        )
+        output = self._ctypes.create_unicode_buffer(8)
+        count = self._user32.ToUnicodeEx(
+            virtual_key,
+            scan_code,
+            state,
+            output,
+            len(output),
+            self._NO_STATE_CHANGE,
+            layout,
+        )
+        if count == 0:
+            return None
+        length = 1 if count < 0 else count
+        return "".join(output[:length])
+
+
 class GlobalKeyboardListener:
     """One visible-app-lifetime listener with capture gated by SessionManager."""
 
@@ -26,6 +114,7 @@ class GlobalKeyboardListener:
         self._records_details = records_details
         self._listener: Any | None = None
         self._keyboard: Any | None = None
+        self._layout_character: Callable[[int], str | None] | None = None
         self._ctrl_down = False
         self._alt_down = False
         self._state_lock = threading.Lock()
@@ -36,6 +125,7 @@ class GlobalKeyboardListener:
         from pynput import keyboard
 
         self._keyboard = keyboard
+        self._layout_character = _ForegroundLayoutTranslator()
         listener = keyboard.Listener(
             on_press=self._safe_press,
             on_release=self._safe_release,
@@ -146,6 +236,14 @@ class GlobalKeyboardListener:
                 return label
 
         char = getattr(key, "char", None)
+        virtual_key = getattr(key, "vk", None)
+        if isinstance(virtual_key, int) and self._layout_character is not None:
+            try:
+                translated = self._layout_character(virtual_key)
+            except (OSError, ValueError):
+                translated = None
+            if isinstance(translated, str) and translated and translated.isprintable():
+                return translated
         if isinstance(char, str) and char:
             if char == " ":
                 return "[SPACE]"

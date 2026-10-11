@@ -56,6 +56,8 @@ class InteractiveLessonUiTests(unittest.TestCase):
         self.assertFalse(self.app.controller.prepared)
         self.assertEqual(RevealStage.SUMMARY, self.app._reveal_stage)
         self.assertEqual("Готов синтетичен пример", self.app.summary_vars["origin"].get())
+        self.assertEqual("0,2 сек.", self.app.playback_speed_var.get())
+        self.assertEqual(100, self.app.PLAYBACK_SPEEDS["0,1 сек."])
         self.assertEqual((), self.app.journal_tree.get_children())
         self.assertEqual("", self.app.reconstructed_text.get("1.0", "end-1c"))
         visible_summary = " ".join(value.get() for value in self.app.summary_vars.values())

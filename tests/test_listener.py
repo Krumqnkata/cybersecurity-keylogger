@@ -91,6 +91,15 @@ class GlobalKeyboardListenerTests(unittest.TestCase):
         self.assertEqual(["a"], captured)
         self.assertEqual([], failures)
 
+    def test_foreground_layout_translation_wins_over_stale_latin_character(self) -> None:
+        listener, captured, _, failures = synthetic_listener()
+        listener._layout_character = lambda virtual_key: "ч" if virtual_key == 0x58 else None
+
+        listener._safe_press(CharacterKey("x", vk=0x58))
+
+        self.assertEqual(["ч"], captured)
+        self.assertEqual([], failures)
+
     def test_release_clears_hotkey_modifier_state(self) -> None:
         listener, _, emergencies, failures = synthetic_listener()
 
