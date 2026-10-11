@@ -4,7 +4,15 @@ import queue
 import unittest
 
 from keyboard_demo.controller import DemoController
-from keyboard_demo.domain import CaptureMode, KeyCaptured, SessionState, StopReason
+from keyboard_demo.domain import (
+    CaptureMode,
+    KeyCaptured,
+    SessionOrigin,
+    SessionState,
+    SessionStopped,
+    StopReason,
+)
+from keyboard_demo.lesson import build_synthetic_example
 from keyboard_demo.session import SessionManager, SessionStartError
 
 
@@ -149,6 +157,40 @@ class SessionManagerTests(unittest.TestCase):
         manager.stop()
         manager.start(300)
         self.assertEqual(300, manager.snapshot().duration_seconds)
+
+    def test_synthetic_example_loads_stopped_without_emergency_listener(self) -> None:
+        manager = SessionManager(watchdog_enabled=False)
+        records = build_synthetic_example()
+
+        session_id = manager.load_synthetic(records)
+
+        snapshot = manager.snapshot()
+        self.assertEqual(session_id, snapshot.session_id)
+        self.assertEqual(SessionState.STOPPED, snapshot.state)
+        self.assertEqual(SessionOrigin.SYNTHETIC, snapshot.origin)
+        self.assertEqual(CaptureMode.EVENTS, snapshot.mode)
+        self.assertEqual(len(records), snapshot.event_count)
+        self.assertEqual(records[-1].elapsed_seconds, snapshot.elapsed_seconds)
+        self.assertFalse(snapshot.emergency_ready)
+        messages = []
+        while True:
+            try:
+                messages.append(manager.notifications.get_nowait())
+            except queue.Empty:
+                break
+        self.assertEqual(1, len(messages))
+        self.assertIsInstance(messages[0], SessionStopped)
+        self.assertFalse(any(isinstance(item, KeyCaptured) for item in messages))
+
+    def test_start_after_synthetic_example_returns_to_live_origin(self) -> None:
+        manager, _ = ready_manager()
+        manager.load_synthetic(build_synthetic_example())
+
+        manager.start(60)
+
+        self.assertEqual(SessionOrigin.LIVE, manager.snapshot().origin)
+        self.assertEqual(SessionState.RECORDING, manager.snapshot().state)
+        self.assertEqual((), manager.journal())
 
 
 class FakeListener:

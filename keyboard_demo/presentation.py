@@ -1,8 +1,11 @@
-"""Human-friendly formatting that does not reconstruct entered text."""
+"""Human-friendly formatting, summaries, and in-memory lesson replay."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+
+from .domain import KeyRecord
 
 
 SPECIAL_KEY_NAMES = {
@@ -25,6 +28,30 @@ SPECIAL_KEY_NAMES = {
     "[PAGE DOWN]": "Page Down — страница надолу",
     "[НЕИЗВЕСТЕН]": "Неразпознат клавиш",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class ReconstructionState:
+    text: str = ""
+    cursor: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayFrame:
+    index: int
+    total: int
+    text: str
+    cursor: int
+    record: KeyRecord | None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionSummary:
+    total_events: int
+    elapsed_seconds: float
+    printable_characters: int | None
+    corrections: int | None
+    special_keys: int | None
 
 
 def format_event_time(elapsed_seconds: float) -> str:
@@ -54,82 +81,131 @@ def describe_key(display_key: str) -> str:
     return f"Получен клавиш: {display_key}"
 
 
+def apply_key_event(state: ReconstructionState, display_key: str) -> ReconstructionState:
+    """Return a new reconstruction state after applying one received event."""
+    text, cursor = state.text, state.cursor
+    inserted = {"[SPACE]": " ", "[ENTER]": "\n", "[TAB]": "\t"}
+
+    if len(display_key) == 1 and display_key.isprintable():
+        return _insert(state, display_key)
+    if display_key in inserted:
+        return _insert(state, inserted[display_key])
+    if display_key == "[BACKSPACE]" and cursor > 0:
+        return ReconstructionState(text[: cursor - 1] + text[cursor:], cursor - 1)
+    if display_key == "[DELETE]" and cursor < len(text):
+        return ReconstructionState(text[:cursor] + text[cursor + 1 :], cursor)
+    if display_key == "[LEFT]":
+        return ReconstructionState(text, max(0, cursor - 1))
+    if display_key == "[RIGHT]":
+        return ReconstructionState(text, min(len(text), cursor + 1))
+    if display_key == "[HOME]":
+        return ReconstructionState(text, _line_start(text, cursor))
+    if display_key == "[END]":
+        return ReconstructionState(text, _line_end(text, cursor))
+    if display_key == "[UP]":
+        return ReconstructionState(text, _move_vertical(text, cursor, -1))
+    if display_key == "[DOWN]":
+        return ReconstructionState(text, _move_vertical(text, cursor, 1))
+    return state
+
+
 def reconstruct_text(display_keys: Iterable[str]) -> str:
-    """Rebuild the linear text implied by the received event sequence."""
-    buffer: list[str] = []
-    cursor = 0
-    inserted = {
-        "[SPACE]": " ",
-        "[ENTER]": "\n",
-        "[TAB]": "\t",
-    }
-    ignored = {
-        "[SHIFT]",
-        "[CTRL]",
-        "[ALT]",
-        "[ESC]",
-        "[PAGE UP]",
-        "[PAGE DOWN]",
-        "[НЕИЗВЕСТЕН]",
-    }
-
+    state = ReconstructionState()
     for key in display_keys:
-        if len(key) == 1 and key.isprintable():
-            buffer.insert(cursor, key)
-            cursor += 1
-        elif key in inserted:
-            buffer.insert(cursor, inserted[key])
-            cursor += 1
-        elif key == "[BACKSPACE]" and cursor > 0:
-            cursor -= 1
-            buffer.pop(cursor)
-        elif key == "[DELETE]" and cursor < len(buffer):
-            buffer.pop(cursor)
-        elif key == "[LEFT]":
-            cursor = max(0, cursor - 1)
-        elif key == "[RIGHT]":
-            cursor = min(len(buffer), cursor + 1)
-        elif key == "[HOME]":
-            cursor = _line_start(buffer, cursor)
-        elif key == "[END]":
-            cursor = _line_end(buffer, cursor)
-        elif key == "[UP]":
-            cursor = _move_vertical(buffer, cursor, -1)
-        elif key == "[DOWN]":
-            cursor = _move_vertical(buffer, cursor, 1)
-        elif key in ignored or (key.startswith("[") and key.endswith("]")):
-            continue
-
-    return "".join(buffer)
+        state = apply_key_event(state, key)
+    return state.text
 
 
-def _line_start(buffer: list[str], cursor: int) -> int:
-    try:
-        return len(buffer) - 1 - buffer[::-1].index("\n", len(buffer) - cursor) + 1
-    except ValueError:
-        return 0
+def summarize_session(
+    records: Sequence[KeyRecord],
+    *,
+    total_events: int,
+    elapsed_seconds: float,
+    detailed: bool,
+) -> SessionSummary:
+    """Build a content-free summary; count-only details stay unavailable."""
+    if not detailed:
+        return SessionSummary(total_events, elapsed_seconds, None, None, None)
+    printable = sum(
+        1 for record in records if len(record.display_key) == 1 and record.display_key.isprintable()
+    )
+    corrections = sum(
+        1 for record in records if record.display_key in {"[BACKSPACE]", "[DELETE]"}
+    )
+    return SessionSummary(
+        total_events,
+        elapsed_seconds,
+        printable,
+        corrections,
+        max(0, total_events - printable - corrections),
+    )
 
 
-def _line_end(buffer: list[str], cursor: int) -> int:
-    try:
-        return buffer.index("\n", cursor)
-    except ValueError:
-        return len(buffer)
+class ReplayModel:
+    """Random-access replay with sparse checkpoints for responsive sliders."""
+
+    CHECKPOINT_INTERVAL = 100
+
+    def __init__(self, records: Sequence[KeyRecord]) -> None:
+        self.records = tuple(records)
+        self._checkpoints: dict[int, ReconstructionState] = {
+            0: ReconstructionState()
+        }
+        self._current_index = 0
+        self._current_state = ReconstructionState()
+
+    @property
+    def total(self) -> int:
+        return len(self.records)
+
+    def frame_at(self, index: int) -> ReplayFrame:
+        target = max(0, min(self.total, int(index)))
+        if target >= self._current_index:
+            start = self._current_index
+            state = self._current_state
+        else:
+            start = max(item for item in self._checkpoints if item <= target)
+            state = self._checkpoints[start]
+
+        for position in range(start, target):
+            state = apply_key_event(state, self.records[position].display_key)
+            completed = position + 1
+            if completed % self.CHECKPOINT_INTERVAL == 0:
+                self._checkpoints[completed] = state
+
+        self._current_index = target
+        self._current_state = state
+        record = self.records[target - 1] if target else None
+        return ReplayFrame(target, self.total, state.text, state.cursor, record)
 
 
-def _move_vertical(buffer: list[str], cursor: int, direction: int) -> int:
-    current_start = _line_start(buffer, cursor)
+def _insert(state: ReconstructionState, value: str) -> ReconstructionState:
+    text, cursor = state.text, state.cursor
+    return ReconstructionState(text[:cursor] + value + text[cursor:], cursor + len(value))
+
+
+def _line_start(text: str, cursor: int) -> int:
+    return text.rfind("\n", 0, cursor) + 1
+
+
+def _line_end(text: str, cursor: int) -> int:
+    result = text.find("\n", cursor)
+    return len(text) if result < 0 else result
+
+
+def _move_vertical(text: str, cursor: int, direction: int) -> int:
+    current_start = _line_start(text, cursor)
     column = cursor - current_start
     if direction < 0:
         if current_start == 0:
             return cursor
         previous_end = current_start - 1
-        previous_start = _line_start(buffer, previous_end)
+        previous_start = _line_start(text, previous_end)
         return previous_start + min(column, previous_end - previous_start)
 
-    current_end = _line_end(buffer, cursor)
-    if current_end >= len(buffer):
+    current_end = _line_end(text, cursor)
+    if current_end >= len(text):
         return cursor
     next_start = current_end + 1
-    next_end = _line_end(buffer, next_start)
+    next_end = _line_end(text, next_start)
     return next_start + min(column, next_end - next_start)

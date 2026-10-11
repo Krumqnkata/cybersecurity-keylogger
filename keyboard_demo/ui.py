@@ -11,17 +11,21 @@ from .controller import DemoController
 from .domain import (
     CaptureMode,
     KeyCaptured,
+    RevealStage,
     SessionStarted,
     SessionState,
     SessionStopped,
     StopReason,
 )
+from .lesson import build_synthetic_example
 from .listener import GlobalKeyboardListener
 from .presentation import (
+    ReplayModel,
     describe_key,
     format_countdown,
     format_event_time,
     reconstruct_text,
+    summarize_session,
 )
 from .questions import QUESTIONS
 from .session import SessionManager, SessionStartError
@@ -226,6 +230,11 @@ class MainApplication:
         "2 минути": 120,
         "5 минути": 300,
     }
+    PLAYBACK_SPEEDS = {
+        "1,0 сек.": 1000,
+        "0,5 сек.": 500,
+        "0,2 сек.": 200,
+    }
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -237,8 +246,14 @@ class MainApplication:
         self.root.geometry(f"{width}x{height}")
         self.root.minsize(720, 480)
         self._closed = False
-        self._journal_visible = False
-        self._reconstruction_marker: tuple[int, int] | None = None
+        self._reveal_stage = RevealStage.HIDDEN
+        self._replay_model: ReplayModel | None = None
+        self._replay_session_id: int | None = None
+        self._playback_index = 0
+        self._playback_running = False
+        self._playback_after_id: str | None = None
+        self._slider_after_id: str | None = None
+        self._suppress_slider_callback = False
         self._last_stop_notice: tuple[int, StopReason] | None = None
         self._practice_window: PracticeWindow | None = None
         self._questions_window: QuestionsWindow | None = None
@@ -368,7 +383,7 @@ class MainApplication:
             controls, text="Стоп", command=self._stop, state="disabled"
         )
         self.reveal_button = ttk.Button(
-            controls, text="Разкрий журнала", command=self._toggle_journal
+            controls, text="Покажи обобщението", command=self._toggle_journal
         )
         self.clear_button = ttk.Button(controls, text="Изчисти", command=self._clear)
         self.practice_button = ttk.Button(
@@ -376,6 +391,9 @@ class MainApplication:
         )
         self.questions_button = ttk.Button(
             controls, text="Въпроси за класа", command=self._open_questions
+        )
+        self.example_button = ttk.Button(
+            controls, text="Готов пример", command=self._load_synthetic_example
         )
         self.exit_button = ttk.Button(controls, text="Изход", command=self._close)
         buttons = (
@@ -385,6 +403,7 @@ class MainApplication:
             self.clear_button,
             self.practice_button,
             self.questions_button,
+            self.example_button,
             self.exit_button,
         )
         for index, button in enumerate(buttons):
@@ -407,22 +426,193 @@ class MainApplication:
             row=7, column=0, sticky="w", pady=(0, 8)
         )
 
-        journal_group = ttk.LabelFrame(body, text="Журнал в оперативната памет", padding=8)
-        journal_group.grid(row=8, column=0, sticky="nsew")
-        journal_group.columnconfigure(0, weight=1)
-        journal_group.rowconfigure(0, weight=1)
+        self.results_group = ttk.LabelFrame(
+            body, text="Резултат в оперативната памет", padding=8
+        )
+        self.results_group.grid(row=8, column=0, sticky="nsew")
+        self.results_group.columnconfigure(0, weight=1)
+        self.results_group.rowconfigure(0, weight=1)
         self.journal_placeholder = ttk.Label(
-            journal_group,
+            self.results_group,
             text="Предположете какво е записано. Водещият ще разкрие резултата.",
             anchor="center",
             font=("Segoe UI", 13, "italic"),
         )
         self.journal_placeholder.grid(row=0, column=0, sticky="nsew", pady=35)
-        self.journal_frame = ttk.Frame(journal_group)
-        self.journal_frame.columnconfigure(0, weight=1)
-        self.journal_frame.rowconfigure(0, weight=1)
+        self._build_summary_stage()
+        self._build_replay_stage()
+        self._build_full_stage()
+
+    def _build_summary_stage(self) -> None:
+        self.summary_frame = ttk.Frame(self.results_group, padding=8)
+        self.summary_frame.columnconfigure(0, weight=1)
+        ttk.Label(
+            self.summary_frame,
+            text="Етап 1 от 3 — Обобщение без съдържание",
+            font=("Segoe UI", 16, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            self.summary_frame,
+            text="Преди да разкриете клавишите, нека класът предположи какво ще види.",
+            wraplength=950,
+        ).grid(row=1, column=0, sticky="w", pady=(3, 10))
+
+        facts = ttk.Frame(self.summary_frame)
+        facts.grid(row=2, column=0, sticky="ew")
+        for column in range(3):
+            facts.columnconfigure(column, weight=1)
+        self.summary_vars = {
+            "origin": tk.StringVar(value="—"),
+            "events": tk.StringVar(value="0"),
+            "elapsed": tk.StringVar(value="00:00.0"),
+            "characters": tk.StringVar(value="—"),
+            "corrections": tk.StringVar(value="—"),
+            "special": tk.StringVar(value="—"),
+        }
+        summary_fields = (
+            ("Източник", "origin"),
+            ("Общо събития", "events"),
+            ("Продължителност", "elapsed"),
+            ("Печатни символи", "characters"),
+            ("Редакции", "corrections"),
+            ("Специални клавиши", "special"),
+        )
+        for index, (caption, key) in enumerate(summary_fields):
+            card = ttk.LabelFrame(facts, text=caption, padding=8)
+            card.grid(
+                row=index // 3,
+                column=index % 3,
+                sticky="nsew",
+                padx=4,
+                pady=4,
+            )
+            ttk.Label(
+                card,
+                textvariable=self.summary_vars[key],
+                font=("Segoe UI", 13, "bold"),
+                wraplength=260,
+            ).pack(anchor="center")
+
+        self.summary_privacy_var = tk.StringVar(value="")
+        ttk.Label(
+            self.summary_frame,
+            textvariable=self.summary_privacy_var,
+            foreground="#7c2d12",
+            wraplength=950,
+        ).grid(row=3, column=0, sticky="w", pady=10)
+        summary_controls = ttk.Frame(self.summary_frame)
+        summary_controls.grid(row=4, column=0, sticky="ew")
+        self.summary_next_button = ttk.Button(
+            summary_controls,
+            text="Към възпроизвеждането →",
+            command=self._show_replay_stage,
+        )
+        self.summary_next_button.pack(side="right")
+
+    def _build_replay_stage(self) -> None:
+        self.replay_frame = ttk.Frame(self.results_group, padding=8)
+        self.replay_frame.columnconfigure(0, weight=1)
+        ttk.Label(
+            self.replay_frame,
+            text="Етап 2 от 3 — Възпроизвеждане стъпка по стъпка",
+            font=("Segoe UI", 16, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        self.replay_step_var = tk.StringVar(value="Стъпка 0 от 0")
+        self.replay_event_var = tk.StringVar(value="Начало — няма приложено събитие.")
+        self.replay_time_var = tk.StringVar(value="Момент: 00:00.0")
+        replay_head = ttk.Frame(self.replay_frame)
+        replay_head.grid(row=1, column=0, sticky="ew", pady=(8, 2))
+        ttk.Label(
+            replay_head,
+            textvariable=self.replay_step_var,
+            font=("Segoe UI", 12, "bold"),
+        ).pack(side="left")
+        ttk.Label(replay_head, textvariable=self.replay_time_var).pack(side="right")
+        ttk.Label(
+            self.replay_frame,
+            textvariable=self.replay_event_var,
+            font=("Segoe UI", 13),
+            wraplength=950,
+        ).grid(row=2, column=0, sticky="w", pady=(2, 8))
+
+        self.replay_scale_var = tk.DoubleVar(value=0)
+        self.replay_scale = ttk.Scale(
+            self.replay_frame,
+            from_=0,
+            to=1,
+            variable=self.replay_scale_var,
+            command=self._on_replay_slider,
+        )
+        self.replay_scale.grid(row=3, column=0, sticky="ew")
+
+        replay_controls = ttk.Frame(self.replay_frame)
+        replay_controls.grid(row=4, column=0, sticky="ew", pady=8)
+        self.replay_previous_button = ttk.Button(
+            replay_controls, text="← Назад", command=lambda: self._step_replay(-1)
+        )
+        self.replay_previous_button.pack(side="left")
+        self.replay_play_button = ttk.Button(
+            replay_controls, text="Пусни", command=self._toggle_playback
+        )
+        self.replay_play_button.pack(side="left", padx=6)
+        self.replay_next_button = ttk.Button(
+            replay_controls, text="Напред →", command=lambda: self._step_replay(1)
+        )
+        self.replay_next_button.pack(side="left")
+        ttk.Button(
+            replay_controls, text="Отначало", command=self._restart_replay
+        ).pack(side="left", padx=6)
+        ttk.Label(replay_controls, text="Скорост:").pack(side="left", padx=(14, 4))
+        self.playback_speed_var = tk.StringVar(value="0,5 сек.")
+        self.playback_speed_box = ttk.Combobox(
+            replay_controls,
+            textvariable=self.playback_speed_var,
+            values=tuple(self.PLAYBACK_SPEEDS),
+            state="readonly",
+            width=9,
+        )
+        self.playback_speed_box.pack(side="left")
+        self.playback_speed_box.bind("<<ComboboxSelected>>", self._speed_changed)
+
+        ttk.Label(
+            self.replay_frame,
+            text="Червената черта ▌ показва симулираната позиция на курсора.",
+            foreground="#991b1b",
+        ).grid(row=5, column=0, sticky="w")
+        self.replay_text = tk.Text(
+            self.replay_frame,
+            height=8,
+            wrap="word",
+            font=("Consolas", 15),
+            padx=8,
+            pady=8,
+            state="disabled",
+        )
+        self.replay_text.tag_configure("cursor", foreground="#b3261e")
+        self.replay_text.grid(row=6, column=0, sticky="ew", pady=(4, 8))
+
+        replay_navigation = ttk.Frame(self.replay_frame)
+        replay_navigation.grid(row=7, column=0, sticky="ew")
+        ttk.Button(
+            replay_navigation, text="← Обобщение", command=self._show_summary_stage
+        ).pack(side="left")
+        ttk.Button(
+            replay_navigation,
+            text="Покажи пълния резултат →",
+            command=self._show_full_stage,
+        ).pack(side="right")
+
+    def _build_full_stage(self) -> None:
+        self.full_frame = ttk.Frame(self.results_group, padding=8)
+        self.full_frame.columnconfigure(0, weight=1)
+        self.full_frame.rowconfigure(1, weight=1)
+        ttk.Label(
+            self.full_frame,
+            text="Етап 3 от 3 — Пълен журнал и сглобен текст",
+            font=("Segoe UI", 16, "bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
         self.journal_tree = ttk.Treeview(
-            self.journal_frame,
+            self.full_frame,
             columns=("number", "time", "key"),
             show="headings",
             height=11,
@@ -437,18 +627,18 @@ class MainApplication:
         self.journal_tree.tag_configure("odd", background="#f8fafc")
         self.journal_tree.tag_configure("even", background="#eaf2f8")
         journal_scroll = ttk.Scrollbar(
-            self.journal_frame, orient="vertical", command=self.journal_tree.yview
+            self.full_frame, orient="vertical", command=self.journal_tree.yview
         )
         self.journal_tree.configure(yscrollcommand=journal_scroll.set)
-        self.journal_tree.grid(row=0, column=0, sticky="nsew")
-        journal_scroll.grid(row=0, column=1, sticky="ns")
+        self.journal_tree.grid(row=1, column=0, sticky="nsew")
+        journal_scroll.grid(row=1, column=1, sticky="ns")
 
         reconstructed = ttk.LabelFrame(
-            self.journal_frame,
+            self.full_frame,
             text="Сглобен текст от получените събития",
             padding=8,
         )
-        reconstructed.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        reconstructed.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         reconstructed.columnconfigure(0, weight=1)
         ttk.Label(
             reconstructed,
@@ -469,6 +659,18 @@ class MainApplication:
             state="disabled",
         )
         self.reconstructed_text.grid(row=1, column=0, sticky="ew")
+        full_navigation = ttk.Frame(self.full_frame)
+        full_navigation.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(
+            full_navigation,
+            text="← Възпроизвеждане",
+            command=self._show_replay_stage,
+        ).pack(side="left")
+        ttk.Button(
+            full_navigation,
+            text="Скрий резултатите",
+            command=self._hide_results,
+        ).pack(side="right")
 
     def _prepare_listener(self) -> None:
         if self._closed:
@@ -491,8 +693,7 @@ class MainApplication:
         except (KeyError, SessionStartError) as exc:
             messagebox.showerror("Сесията не стартира", str(exc), parent=self.root)
             return
-        self._clear_tree()
-        self._hide_journal()
+        self._reset_results()
         self._last_stop_notice = None
         self.stop_detail_var.set("")
         self.overlay.show()
@@ -504,63 +705,265 @@ class MainApplication:
 
     def _clear(self) -> None:
         self.session.reset()
-        self._clear_tree()
-        self._hide_journal()
+        self._reset_results()
         self.stop_detail_var.set("")
         self.overlay.hide()
         self._update_ui()
 
     def _mode_changed(self) -> None:
         self.session.reset(mode=CaptureMode(self.mode_var.get()))
-        self._clear_tree()
-        self._hide_journal()
+        self._reset_results()
         self.stop_detail_var.set("Режимът е сменен. Натиснете „Старт“ за нова сесия.")
         self.overlay.hide()
         self._update_ui()
 
     def _toggle_journal(self) -> None:
-        if self._journal_visible:
-            self._hide_journal()
+        if self._reveal_stage is RevealStage.HIDDEN:
+            self._show_summary_stage()
         else:
-            self._update_reconstructed_text()
-            self.journal_placeholder.grid_remove()
-            self.journal_frame.grid(row=0, column=0, sticky="nsew")
-            self._journal_visible = True
-            self.reveal_button.configure(text="Скрий журнала")
+            self._hide_results()
 
-    def _hide_journal(self) -> None:
-        self.journal_frame.grid_remove()
-        self.journal_placeholder.grid()
-        self._journal_visible = False
-        self.reveal_button.configure(text="Разкрий журнала")
+    def _show_summary_stage(self) -> None:
+        self._pause_playback()
+        snapshot = self.session.snapshot()
+        records = self.session.journal()
+        summary = summarize_session(
+            records,
+            total_events=snapshot.event_count,
+            elapsed_seconds=snapshot.elapsed_seconds,
+            detailed=snapshot.mode is CaptureMode.EVENTS,
+        )
+        self.summary_vars["origin"].set(snapshot.origin.bulgarian_name)
+        self.summary_vars["events"].set(str(summary.total_events))
+        self.summary_vars["elapsed"].set(format_event_time(summary.elapsed_seconds))
+        if summary.printable_characters is None:
+            hidden = "Не се съхранява"
+            self.summary_vars["characters"].set(hidden)
+            self.summary_vars["corrections"].set(hidden)
+            self.summary_vars["special"].set(hidden)
+            self.summary_privacy_var.set(
+                "Режимът „Само брояч“ пази единствено общия брой. "
+                "Няма данни за възпроизвеждане или пълен журнал."
+            )
+            self.summary_next_button.configure(state="disabled")
+        else:
+            self.summary_vars["characters"].set(str(summary.printable_characters))
+            self.summary_vars["corrections"].set(str(summary.corrections))
+            self.summary_vars["special"].set(str(summary.special_keys))
+            self.summary_privacy_var.set(
+                "Съдържанието все още е скрито. Попитайте класа какъв текст очаква."
+            )
+            self.summary_next_button.configure(
+                state="normal" if records else "disabled"
+            )
+        self._display_stage(RevealStage.SUMMARY)
 
-    def _clear_tree(self) -> None:
+    def _show_replay_stage(self) -> None:
+        snapshot = self.session.snapshot()
+        if snapshot.mode is not CaptureMode.EVENTS or snapshot.event_count == 0:
+            return
+        if self._replay_session_id != snapshot.session_id or self._replay_model is None:
+            self._replay_model = ReplayModel(self.session.journal())
+            self._replay_session_id = snapshot.session_id
+            self._playback_index = 0
+        self._pause_playback()
+        self.replay_scale.configure(to=max(1, self._replay_model.total))
+        self._render_replay_index(self._playback_index)
+        self._display_stage(RevealStage.REPLAY)
+
+    def _show_full_stage(self) -> None:
+        snapshot = self.session.snapshot()
+        if snapshot.mode is not CaptureMode.EVENTS or snapshot.event_count == 0:
+            return
+        self._pause_playback()
+        self._populate_full_result()
+        self._display_stage(RevealStage.FULL)
+
+    def _display_stage(self, stage: RevealStage) -> None:
+        self.journal_placeholder.grid_remove()
+        for frame in (self.summary_frame, self.replay_frame, self.full_frame):
+            frame.grid_remove()
+        self._reveal_stage = stage
+        if stage is RevealStage.HIDDEN:
+            self.journal_placeholder.grid(row=0, column=0, sticky="nsew", pady=35)
+            self.reveal_button.configure(text="Покажи обобщението")
+        elif stage is RevealStage.SUMMARY:
+            self.summary_frame.grid(row=0, column=0, sticky="nsew")
+            self.reveal_button.configure(text="Скрий резултатите")
+        elif stage is RevealStage.REPLAY:
+            self.replay_frame.grid(row=0, column=0, sticky="nsew")
+            self.reveal_button.configure(text="Скрий резултатите")
+        elif stage is RevealStage.FULL:
+            self.full_frame.grid(row=0, column=0, sticky="nsew")
+            self.reveal_button.configure(text="Скрий резултатите")
+
+    def _hide_results(self) -> None:
+        self._cancel_playback(clear_model=True)
+        self._display_stage(RevealStage.HIDDEN)
+
+    def _reset_results(self) -> None:
+        self._cancel_playback(clear_model=True)
+        self._clear_journal_tree()
+        self._set_text_widget(self.reconstructed_text, "")
+        self._set_text_widget(self.replay_text, "")
+        self._display_stage(RevealStage.HIDDEN)
+
+    def _clear_journal_tree(self) -> None:
         children = self.journal_tree.get_children()
         if children:
             self.journal_tree.delete(*children)
-        self._reconstruction_marker = None
-        self._set_reconstructed_text("")
 
-    def _update_reconstructed_text(self) -> None:
-        snapshot = self.session.snapshot()
-        if snapshot.state is SessionState.RECORDING or snapshot.mode is not CaptureMode.EVENTS:
-            self._reconstruction_marker = None
-            self._set_reconstructed_text("")
+    def _populate_full_result(self) -> None:
+        records = self.session.journal()
+        self._clear_journal_tree()
+        for record in records:
+            self.journal_tree.insert(
+                "",
+                "end",
+                values=(
+                    record.sequence,
+                    format_event_time(record.elapsed_seconds),
+                    describe_key(record.display_key),
+                ),
+                tags=("even" if record.sequence % 2 == 0 else "odd",),
+            )
+        assembled = reconstruct_text(record.display_key for record in records)
+        self._set_text_widget(self.reconstructed_text, assembled)
+
+    def _load_synthetic_example(self) -> None:
+        self._reset_results()
+        try:
+            self.session.load_synthetic(build_synthetic_example())
+        except (SessionStartError, ValueError) as exc:
+            messagebox.showerror("Примерът не е зареден", str(exc), parent=self.root)
             return
-        marker = (snapshot.session_id, snapshot.event_count)
-        if marker == self._reconstruction_marker:
+        self.mode_var.set(CaptureMode.EVENTS.value)
+        self._last_stop_notice = None
+        self.stop_detail_var.set(StopReason.SYNTHETIC_EXAMPLE.bulgarian_message)
+        self._show_summary_stage()
+        self._update_ui()
+
+    def _render_replay_index(self, index: int) -> None:
+        model = self._replay_model
+        if model is None:
             return
-        assembled = reconstruct_text(
-            record.display_key for record in self.session.journal()
+        frame = model.frame_at(index)
+        self._playback_index = frame.index
+        self._suppress_slider_callback = True
+        self.replay_scale_var.set(frame.index)
+        self._suppress_slider_callback = False
+        self.replay_step_var.set(f"Стъпка {frame.index} от {frame.total}")
+        if frame.record is None:
+            self.replay_event_var.set("Начало — няма приложено събитие.")
+            self.replay_time_var.set("Момент: 00:00.0")
+        else:
+            self.replay_event_var.set(describe_key(frame.record.display_key))
+            self.replay_time_var.set(
+                f"Момент: {format_event_time(frame.record.elapsed_seconds)}"
+            )
+        marked = frame.text[: frame.cursor] + "▌" + frame.text[frame.cursor :]
+        self._set_text_widget(self.replay_text, marked, cursor_index=frame.cursor)
+        self.replay_previous_button.configure(
+            state="normal" if frame.index > 0 else "disabled"
         )
-        self._set_reconstructed_text(assembled)
-        self._reconstruction_marker = marker
+        self.replay_next_button.configure(
+            state="normal" if frame.index < frame.total else "disabled"
+        )
 
-    def _set_reconstructed_text(self, value: str) -> None:
-        self.reconstructed_text.configure(state="normal")
-        self.reconstructed_text.delete("1.0", "end")
-        self.reconstructed_text.insert("1.0", value)
-        self.reconstructed_text.configure(state="disabled")
+    def _on_replay_slider(self, raw_value: str) -> None:
+        if self._suppress_slider_callback or self._replay_model is None:
+            return
+        self._pause_playback()
+        target = int(round(float(raw_value)))
+        self._cancel_after("_slider_after_id")
+        self._slider_after_id = self.root.after(
+            75, lambda: self._finish_slider_move(target)
+        )
+
+    def _finish_slider_move(self, target: int) -> None:
+        self._slider_after_id = None
+        if not self._closed and self._reveal_stage is RevealStage.REPLAY:
+            self._render_replay_index(target)
+
+    def _step_replay(self, offset: int) -> None:
+        self._pause_playback()
+        self._render_replay_index(self._playback_index + offset)
+
+    def _restart_replay(self) -> None:
+        self._pause_playback()
+        self._render_replay_index(0)
+
+    def _toggle_playback(self) -> None:
+        if self._playback_running:
+            self._pause_playback()
+            return
+        if self._replay_model is None or self._replay_model.total == 0:
+            return
+        if self._playback_index >= self._replay_model.total:
+            self._render_replay_index(0)
+        self._playback_running = True
+        self.replay_play_button.configure(text="Пауза")
+        self._schedule_playback_tick()
+
+    def _schedule_playback_tick(self) -> None:
+        self._cancel_after("_playback_after_id")
+        delay = self.PLAYBACK_SPEEDS.get(self.playback_speed_var.get(), 500)
+        self._playback_after_id = self.root.after(delay, self._playback_tick)
+
+    def _playback_tick(self) -> None:
+        self._playback_after_id = None
+        if (
+            not self._playback_running
+            or self._closed
+            or self._reveal_stage is not RevealStage.REPLAY
+            or self._replay_model is None
+        ):
+            return
+        self._render_replay_index(self._playback_index + 1)
+        if self._playback_index >= self._replay_model.total:
+            self._pause_playback()
+        else:
+            self._schedule_playback_tick()
+
+    def _speed_changed(self, _event: tk.Event) -> None:
+        if self._playback_running:
+            self._schedule_playback_tick()
+
+    def _pause_playback(self) -> None:
+        self._playback_running = False
+        self._cancel_after("_playback_after_id")
+        self.replay_play_button.configure(text="Пусни")
+
+    def _cancel_playback(self, *, clear_model: bool) -> None:
+        self._pause_playback()
+        self._cancel_after("_slider_after_id")
+        if clear_model:
+            self._replay_model = None
+            self._replay_session_id = None
+            self._playback_index = 0
+
+    def _cancel_after(self, attribute: str) -> None:
+        after_id = getattr(self, attribute)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+            setattr(self, attribute, None)
+
+    @staticmethod
+    def _set_text_widget(
+        widget: tk.Text, value: str, *, cursor_index: int | None = None
+    ) -> None:
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        if cursor_index is None:
+            widget.insert("1.0", value)
+        else:
+            widget.insert("1.0", value[:cursor_index])
+            widget.insert("end", "▌", "cursor")
+            widget.insert("end", value[cursor_index + 1 :])
+        widget.configure(state="disabled")
 
     def _open_practice(self) -> None:
         if (
@@ -573,6 +976,7 @@ class MainApplication:
             self._practice_window.window.lift()
 
     def _open_questions(self) -> None:
+        self._pause_playback()
         self.session.stop(StopReason.QUESTIONS_OPENED)
         self._update_ui()
         if (
@@ -607,17 +1011,9 @@ class MainApplication:
             if message.session_id != current_id:
                 continue
             if isinstance(message, KeyCaptured):
-                record = message.record
-                self.journal_tree.insert(
-                    "",
-                    "end",
-                    values=(
-                        record.sequence,
-                        format_event_time(record.elapsed_seconds),
-                        describe_key(record.display_key),
-                    ),
-                    tags=("even" if record.sequence % 2 == 0 else "odd",),
-                )
+                # The bounded queue is drained here, but content stays hidden
+                # until the teacher reaches the full-result stage.
+                pass
             elif isinstance(message, SessionStopped):
                 self._show_stop_notice(message)
             elif isinstance(message, SessionStarted):
@@ -667,10 +1063,12 @@ class MainApplication:
             self.overlay.hide()
             if snapshot.state is SessionState.STOPPED and snapshot.stop_reason is not None:
                 detail = snapshot.stop_reason.bulgarian_message
-                if snapshot.error_detail:
+                if (
+                    snapshot.stop_reason is StopReason.LISTENER_ERROR
+                    and snapshot.error_detail
+                ):
                     detail = f"{detail} {snapshot.error_detail}"
                 self.stop_detail_var.set(detail)
-                self._update_reconstructed_text()
         self.start_button.configure(
             state="normal" if snapshot.emergency_ready and not recording else "disabled"
         )
@@ -679,9 +1077,9 @@ class MainApplication:
         for button in self.mode_buttons:
             button.configure(state=option_state)
         self.duration_box.configure(state="disabled" if recording else "readonly")
+        self.example_button.configure(state="disabled" if recording else "normal")
         can_reveal = (
-            not recording
-            and snapshot.mode is CaptureMode.EVENTS
+            snapshot.state is SessionState.STOPPED
             and snapshot.event_count > 0
         )
         self.reveal_button.configure(state="normal" if can_reveal else "disabled")
@@ -689,6 +1087,7 @@ class MainApplication:
     def _close(self) -> None:
         if self._closed:
             return
+        self._cancel_playback(clear_model=True)
         self._closed = True
         self.overlay.hide()
         self.controller.close()

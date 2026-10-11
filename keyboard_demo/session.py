@@ -6,13 +6,14 @@ import math
 import queue
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from .domain import (
     CaptureMode,
     GuiNotification,
     KeyCaptured,
     KeyRecord,
+    SessionOrigin,
     SessionSnapshot,
     SessionStarted,
     SessionState,
@@ -49,11 +50,13 @@ class SessionManager:
         self._lock = threading.RLock()
         self._state = SessionState.READY
         self._mode = CaptureMode.EVENTS
+        self._origin = SessionOrigin.LIVE
         self._duration = 120
         self._session_id = 0
         self._started_at = 0.0
         self._deadline = 0.0
         self._remaining_at_stop = 120.0
+        self._elapsed_at_stop = 0.0
         self._event_count = 0
         self._journal: list[KeyRecord] = []
         self._stop_reason: StopReason | None = None
@@ -87,9 +90,11 @@ class SessionManager:
             self._cancel_timer_locked()
             self._session_id += 1
             self._duration = duration_seconds
+            self._origin = SessionOrigin.LIVE
             self._started_at = self._clock()
             self._deadline = self._started_at + duration_seconds
             self._remaining_at_stop = float(duration_seconds)
+            self._elapsed_at_stop = 0.0
             self._event_count = 0
             self._journal.clear()
             self._stop_reason = None
@@ -159,6 +164,47 @@ class SessionManager:
             if self._state is SessionState.RECORDING:
                 self._finish_locked(StopReason.LISTENER_ERROR, detail)
 
+    def load_synthetic(self, records: Sequence[KeyRecord]) -> int:
+        """Load a stopped in-memory lesson result without starting capture."""
+        if len(records) > self._journal_limit:
+            raise ValueError("Синтетичният пример надвишава лимита на журнала.")
+
+        normalized: list[KeyRecord] = []
+        previous_time = 0.0
+        for sequence, record in enumerate(records, start=1):
+            if record.elapsed_seconds < previous_time:
+                raise ValueError("Времената в синтетичния пример не са подредени.")
+            if not isinstance(record.display_key, str) or not record.display_key:
+                raise ValueError("Синтетичният пример съдържа невалиден клавиш.")
+            previous_time = record.elapsed_seconds
+            normalized.append(
+                KeyRecord(sequence, record.elapsed_seconds, record.display_key)
+            )
+
+        with self._lock:
+            if self._closed:
+                raise SessionStartError("Приложението вече се затваря.")
+            if self._state is SessionState.RECORDING:
+                self._finish_locked(StopReason.CLEARED)
+            self._cancel_timer_locked()
+            self._drain_notifications_locked()
+            self._session_id += 1
+            self._mode = CaptureMode.EVENTS
+            self._origin = SessionOrigin.SYNTHETIC
+            self._journal = normalized
+            self._event_count = len(normalized)
+            self._elapsed_at_stop = previous_time
+            self._remaining_at_stop = 0.0
+            self._state = SessionState.STOPPED
+            self._stop_reason = StopReason.SYNTHETIC_EXAMPLE
+            self._emit_locked(
+                SessionStopped(
+                    self._session_id,
+                    StopReason.SYNTHETIC_EXAMPLE,
+                )
+            )
+            return self._session_id
+
     def reset(self, *, mode: CaptureMode | None = None) -> None:
         """Stop first, then remove all in-memory data and pending GUI messages."""
         with self._lock:
@@ -171,9 +217,11 @@ class SessionManager:
                 self._mode = mode
             self._event_count = 0
             self._journal.clear()
+            self._origin = SessionOrigin.LIVE
             self._stop_reason = None
             self._error_detail = "" if self._emergency_ready else self._error_detail
             self._remaining_at_stop = float(self._duration)
+            self._elapsed_at_stop = 0.0
             self._state = SessionState.READY
             self._drain_notifications_locked()
 
@@ -193,13 +241,19 @@ class SessionManager:
         with self._lock:
             if self._state is SessionState.RECORDING:
                 remaining = max(0.0, self._deadline - self._clock())
+                elapsed = min(
+                    float(self._duration), max(0.0, self._clock() - self._started_at)
+                )
             else:
                 remaining = max(0.0, self._remaining_at_stop)
+                elapsed = max(0.0, self._elapsed_at_stop)
             return SessionSnapshot(
                 session_id=self._session_id,
                 state=self._state,
                 mode=self._mode,
+                origin=self._origin,
                 duration_seconds=self._duration,
+                elapsed_seconds=elapsed,
                 remaining_seconds=remaining,
                 event_count=self._event_count,
                 stop_reason=self._stop_reason,
@@ -226,6 +280,9 @@ class SessionManager:
         if self._state is not SessionState.RECORDING:
             return
         self._remaining_at_stop = max(0.0, self._deadline - self._clock())
+        self._elapsed_at_stop = min(
+            float(self._duration), max(0.0, self._clock() - self._started_at)
+        )
         self._state = SessionState.STOPPED
         self._stop_reason = reason
         if detail:

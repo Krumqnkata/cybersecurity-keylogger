@@ -31,6 +31,24 @@ class SessionState(str, Enum):
         }[self]
 
 
+class SessionOrigin(str, Enum):
+    LIVE = "live"
+    SYNTHETIC = "synthetic"
+
+    @property
+    def bulgarian_name(self) -> str:
+        if self is SessionOrigin.LIVE:
+            return "Реална демонстрационна сесия"
+        return "Готов синтетичен пример"
+
+
+class RevealStage(str, Enum):
+    HIDDEN = "hidden"
+    SUMMARY = "summary"
+    REPLAY = "replay"
+    FULL = "full"
+
+
 class StopReason(str, Enum):
     USER = "user"
     TIMEOUT = "timeout"
@@ -41,6 +59,7 @@ class StopReason(str, Enum):
     QUESTIONS_OPENED = "questions_opened"
     CLEARED = "cleared"
     LISTENER_ERROR = "listener_error"
+    SYNTHETIC_EXAMPLE = "synthetic_example"
     CLOSED = "closed"
 
     @property
@@ -55,6 +74,7 @@ class StopReason(str, Enum):
             StopReason.QUESTIONS_OPENED: "Записът спря преди отваряне на въпросите.",
             StopReason.CLEARED: "Данните са изчистени.",
             StopReason.LISTENER_ERROR: "Записът спря поради проблем със слушателя.",
+            StopReason.SYNTHETIC_EXAMPLE: "Зареден е готовият синтетичен пример.",
             StopReason.CLOSED: "Приложението се затваря.",
         }[self]
 
@@ -71,7 +91,9 @@ class SessionSnapshot:
     session_id: int
     state: SessionState
     mode: CaptureMode
+    origin: SessionOrigin
     duration_seconds: int
+    elapsed_seconds: float
     remaining_seconds: float
     event_count: int
     stop_reason: StopReason | None
