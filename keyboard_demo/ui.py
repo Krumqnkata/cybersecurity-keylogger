@@ -238,6 +238,7 @@ class MainApplication:
         self.root.minsize(720, 480)
         self._closed = False
         self._journal_visible = False
+        self._reconstruction_marker: tuple[int, int] | None = None
         self._last_stop_notice: tuple[int, StopReason] | None = None
         self._practice_window: PracticeWindow | None = None
         self._questions_window: QuestionsWindow | None = None
@@ -537,17 +538,23 @@ class MainApplication:
         children = self.journal_tree.get_children()
         if children:
             self.journal_tree.delete(*children)
+        self._reconstruction_marker = None
         self._set_reconstructed_text("")
 
     def _update_reconstructed_text(self) -> None:
         snapshot = self.session.snapshot()
         if snapshot.state is SessionState.RECORDING or snapshot.mode is not CaptureMode.EVENTS:
+            self._reconstruction_marker = None
             self._set_reconstructed_text("")
+            return
+        marker = (snapshot.session_id, snapshot.event_count)
+        if marker == self._reconstruction_marker:
             return
         assembled = reconstruct_text(
             record.display_key for record in self.session.journal()
         )
         self._set_reconstructed_text(assembled)
+        self._reconstruction_marker = marker
 
     def _set_reconstructed_text(self, value: str) -> None:
         self.reconstructed_text.configure(state="normal")

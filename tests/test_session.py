@@ -141,6 +141,15 @@ class SessionManagerTests(unittest.TestCase):
         with self.assertRaises(SessionStartError):
             manager.start(301)
 
+    def test_two_and_five_minute_sessions_are_available(self) -> None:
+        manager, _ = ready_manager()
+
+        manager.start(120)
+        self.assertEqual(120, manager.snapshot().duration_seconds)
+        manager.stop()
+        manager.start(300)
+        self.assertEqual(300, manager.snapshot().duration_seconds)
+
 
 class FakeListener:
     def __init__(self, *callbacks) -> None:

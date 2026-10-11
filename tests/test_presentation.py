@@ -39,7 +39,7 @@ class PresentationFormattingTests(unittest.TestCase):
     def test_reconstruction_handles_home_end_and_vertical_movement(self) -> None:
         keys = ["a", "b", "[ENTER]", "c", "d", "[HOME]", "X", "[UP]", "Y", "[END]", "!"]
 
-        self.assertEqual("Yab!\nXcd", reconstruct_text(keys))
+        self.assertEqual("aYb!\nXcd", reconstruct_text(keys))
 
 
 if __name__ == "__main__":
